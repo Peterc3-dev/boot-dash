@@ -3,7 +3,6 @@ use std::process::Command;
 #[derive(Debug, Clone)]
 pub struct ServiceInfo {
     pub name: String,
-    pub load_state: String,
     pub active_state: String,
     pub sub_state: String,
     pub description: String,
@@ -35,8 +34,6 @@ pub struct BootTime {
     pub userspace: String,
     pub total: String,
     pub firmware: Option<String>,
-    pub loader: Option<String>,
-    pub raw_output: String,
 }
 
 #[derive(Debug, Clone)]
@@ -49,7 +46,6 @@ pub struct BlameEntry {
 #[derive(Debug, Clone)]
 pub struct JournalEntry {
     pub timestamp: String,
-    pub hostname: String,
     pub unit: String,
     pub message: String,
     pub priority: u8,
@@ -65,7 +61,14 @@ pub struct SystemInfo {
 
 pub fn list_services() -> Vec<ServiceInfo> {
     let output = Command::new("systemctl")
-        .args(["list-units", "--type=service", "--all", "--no-pager", "--no-legend", "--plain"])
+        .args([
+            "list-units",
+            "--type=service",
+            "--all",
+            "--no-pager",
+            "--no-legend",
+            "--plain",
+        ])
         .output();
 
     let output = match output {
@@ -82,31 +85,25 @@ pub fn list_services() -> Vec<ServiceInfo> {
             continue;
         }
 
-        let parts: Vec<&str> = line.splitn(5, char::is_whitespace).collect();
-        let parts: Vec<&str> = parts.iter().map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+        // systemctl columns: UNIT LOAD ACTIVE SUB DESCRIPTION
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        if tokens.len() >= 4 {
+            let name = tokens[0].trim_start_matches('●').trim().to_string();
+            // tokens[1] is LOAD state (not displayed, skipped)
+            let active_state = tokens[2].to_string();
+            let sub_state = tokens[3].to_string();
+            let description = if tokens.len() > 4 {
+                tokens[4..].join(" ")
+            } else {
+                String::new()
+            };
 
-        if parts.len() >= 4 {
-            // Re-parse more carefully: split into whitespace-delimited tokens
-            let tokens: Vec<&str> = line.split_whitespace().collect();
-            if tokens.len() >= 4 {
-                let name = tokens[0].trim_start_matches('●').trim().to_string();
-                let load_state = tokens[1].to_string();
-                let active_state = tokens[2].to_string();
-                let sub_state = tokens[3].to_string();
-                let description = if tokens.len() > 4 {
-                    tokens[4..].join(" ")
-                } else {
-                    String::new()
-                };
-
-                services.push(ServiceInfo {
-                    name,
-                    load_state,
-                    active_state,
-                    sub_state,
-                    description,
-                });
-            }
+            services.push(ServiceInfo {
+                name,
+                active_state,
+                sub_state,
+                description,
+            });
         }
     }
 
@@ -114,9 +111,7 @@ pub fn list_services() -> Vec<ServiceInfo> {
 }
 
 pub fn get_boot_time() -> Option<BootTime> {
-    let output = Command::new("systemd-analyze")
-        .output()
-        .ok()?;
+    let output = Command::new("systemd-analyze").output().ok()?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
 
@@ -128,7 +123,6 @@ pub fn get_boot_time() -> Option<BootTime> {
     let mut userspace = String::new();
     let mut total = String::new();
     let mut firmware = None;
-    let mut loader = None;
 
     // Parse lines like:
     // Startup finished in 3.456s (kernel) + 12.345s (userspace) = 15.801s
@@ -146,9 +140,6 @@ pub fn get_boot_time() -> Option<BootTime> {
             if let Some(f) = extract_parenthesized(line, "firmware") {
                 firmware = Some(f);
             }
-            if let Some(l) = extract_parenthesized(line, "loader") {
-                loader = Some(l);
-            }
         }
     }
 
@@ -157,8 +148,6 @@ pub fn get_boot_time() -> Option<BootTime> {
         userspace,
         total,
         firmware,
-        loader,
-        raw_output: stdout,
     })
 }
 
@@ -172,9 +161,7 @@ fn extract_parenthesized(line: &str, label: &str) -> Option<String> {
     let idx = line.find(&pattern)?;
     // Walk backwards from idx to find the time value
     let before = &line[..idx].trim_end();
-    let time_start = before.rfind(|c: char| c == '+' || c == ' ' || c == '\t')
-        .map(|i| i + 1)
-        .unwrap_or(0);
+    let time_start = before.rfind(['+', ' ', '\t']).map(|i| i + 1).unwrap_or(0);
     Some(before[time_start..].trim().to_string())
 }
 
@@ -226,37 +213,23 @@ fn parse_time_to_ms(s: &str) -> u64 {
                 total_ms += (mins * 60_000.0) as u64;
             }
             let rest = s[min_idx + 3..].trim();
-            if rest.ends_with('s') {
-                if let Ok(secs) = rest[..rest.len() - 1].parse::<f64>() {
+            if let Some(secs_str) = rest.strip_suffix('s') {
+                if let Ok(secs) = secs_str.parse::<f64>() {
                     total_ms += (secs * 1000.0) as u64;
                 }
             }
         }
-    } else if s.ends_with("ms") {
-        if let Ok(ms) = s[..s.len() - 2].parse::<f64>() {
+    } else if let Some(ms_str) = s.strip_suffix("ms") {
+        if let Ok(ms) = ms_str.parse::<f64>() {
             total_ms = ms as u64;
         }
-    } else if s.ends_with('s') {
-        if let Ok(secs) = s[..s.len() - 1].parse::<f64>() {
+    } else if let Some(secs_str) = s.strip_suffix('s') {
+        if let Ok(secs) = secs_str.parse::<f64>() {
             total_ms = (secs * 1000.0) as u64;
         }
     }
 
     total_ms
-}
-
-pub fn get_critical_chain() -> Vec<String> {
-    let output = Command::new("systemd-analyze")
-        .args(["critical-chain", "--no-pager"])
-        .output();
-
-    let output = match output {
-        Ok(o) => o,
-        Err(_) => return Vec::new(),
-    };
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    stdout.lines().map(|l| l.to_string()).collect()
 }
 
 pub fn get_journal(lines: usize, priority: Option<u8>, unit: Option<&str>) -> Vec<JournalEntry> {
@@ -301,7 +274,7 @@ fn parse_journal_line(line: &str) -> JournalEntry {
 
     if tokens.len() >= 5 {
         let timestamp = format!("{} {} {}", tokens[0], tokens[1], tokens[2]);
-        let hostname = tokens[3].to_string();
+        // tokens[3] is the hostname (not displayed, skipped)
 
         let rest = if tokens.len() >= 6 {
             tokens[4..].join(" ")
@@ -326,7 +299,6 @@ fn parse_journal_line(line: &str) -> JournalEntry {
         let priority = guess_priority(&message);
         JournalEntry {
             timestamp,
-            hostname,
             unit,
             message,
             priority,
@@ -334,7 +306,6 @@ fn parse_journal_line(line: &str) -> JournalEntry {
     } else {
         JournalEntry {
             timestamp: String::new(),
-            hostname: String::new(),
             unit: String::new(),
             message: line.to_string(),
             priority: 6,
@@ -360,20 +331,6 @@ fn guess_priority(msg: &str) -> u8 {
         7
     } else {
         6 // info
-    }
-}
-
-pub fn get_unit_journal(unit: &str, lines: usize) -> Vec<String> {
-    let output = Command::new("journalctl")
-        .args(["-u", unit, "--no-pager", "-n", &lines.to_string()])
-        .output();
-
-    match output {
-        Ok(o) => {
-            let stdout = String::from_utf8_lossy(&o.stdout);
-            stdout.lines().map(|l| l.to_string()).collect()
-        }
-        Err(_) => vec!["Failed to read journal".to_string()],
     }
 }
 
@@ -412,16 +369,96 @@ pub fn get_system_info() -> SystemInfo {
     }
 }
 
-pub fn service_action(unit: &str, action: &str) -> Result<String, String> {
-    let output = Command::new("systemctl")
-        .args([action, unit])
-        .output()
-        .map_err(|e| format!("Failed to execute: {}", e))?;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    if output.status.success() {
-        Ok(format!("Successfully {}ed {}", action, unit))
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(format!("Failed to {} {}: {}", action, unit, stderr.trim()))
+    #[test]
+    fn parse_time_seconds() {
+        assert_eq!(parse_time_to_ms("5.123s"), 5123);
+        assert_eq!(parse_time_to_ms("1s"), 1000);
+    }
+
+    #[test]
+    fn parse_time_milliseconds() {
+        assert_eq!(parse_time_to_ms("123ms"), 123);
+        // "ms" must take precedence over the bare "s" suffix.
+        assert_eq!(parse_time_to_ms("250ms"), 250);
+    }
+
+    #[test]
+    fn parse_time_minutes_and_seconds() {
+        assert_eq!(parse_time_to_ms("1min 2.345s"), 62345);
+        assert_eq!(parse_time_to_ms("2min 0.000s"), 120000);
+    }
+
+    #[test]
+    fn parse_time_garbage_is_zero() {
+        assert_eq!(parse_time_to_ms("not-a-time"), 0);
+        assert_eq!(parse_time_to_ms(""), 0);
+    }
+
+    #[test]
+    fn priority_ordering() {
+        assert_eq!(guess_priority("kernel panic - not syncing"), 0);
+        assert_eq!(guess_priority("Critical temperature reached"), 2);
+        assert_eq!(guess_priority("Failed to start foo.service"), 3);
+        assert_eq!(guess_priority("warning: disk almost full"), 4);
+        assert_eq!(guess_priority("Started plain info message"), 6);
+        assert_eq!(guess_priority("debug trace here"), 7);
+    }
+
+    #[test]
+    fn extract_after_equals_parses_total() {
+        let line = "Startup finished in 3.456s (kernel) + 12.345s (userspace) = 15.801s";
+        assert_eq!(extract_after_equals(line).as_deref(), Some("15.801s"));
+        assert_eq!(extract_after_equals("no equals here"), None);
+    }
+
+    #[test]
+    fn extract_parenthesized_finds_each_phase() {
+        let line = "Startup finished in 3.456s (kernel) + 12.345s (userspace) = 15.801s";
+        assert_eq!(
+            extract_parenthesized(line, "kernel").as_deref(),
+            Some("3.456s")
+        );
+        assert_eq!(
+            extract_parenthesized(line, "userspace").as_deref(),
+            Some("12.345s")
+        );
+        assert_eq!(extract_parenthesized(line, "firmware"), None);
+    }
+
+    #[test]
+    fn journal_line_splits_unit_and_message() {
+        let line = "May 07 12:34:56 myhost sshd[1234]: Accepted password for user";
+        let entry = parse_journal_line(line);
+        assert_eq!(entry.timestamp, "May 07 12:34:56");
+        assert_eq!(entry.unit, "sshd");
+        assert_eq!(entry.message, "Accepted password for user");
+    }
+
+    #[test]
+    fn journal_line_without_pid() {
+        let line = "May 07 12:34:56 myhost kernel: Linux version 7.0";
+        let entry = parse_journal_line(line);
+        assert_eq!(entry.unit, "kernel");
+        assert_eq!(entry.message, "Linux version 7.0");
+    }
+
+    #[test]
+    fn status_display_maps_sub_states() {
+        let mk = |active: &str, sub: &str| ServiceInfo {
+            name: "x".into(),
+            active_state: active.into(),
+            sub_state: sub.into(),
+            description: String::new(),
+        };
+        assert_eq!(mk("active", "running").status_display(), "running");
+        assert_eq!(mk("active", "exited").status_display(), "exited");
+        assert_eq!(mk("active", "frobnicating").status_display(), "active");
+        assert_eq!(mk("failed", "failed").status_display(), "failed");
+        assert_eq!(mk("inactive", "dead").status_display(), "inactive");
+        assert_eq!(mk("reloading", "x").status_display(), "unknown");
     }
 }
